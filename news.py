@@ -1,4 +1,3 @@
-import psycopg2
 import requests
 from bs4 import BeautifulSoup
 import os
@@ -9,17 +8,14 @@ import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import time
 import threading
-
-POSTGRES_URL = "postgresql://myuser:mypassword@localhost:5432/mydb"
 
 PUBLIC_ROOT = "../public"
 IMAGE_DIRECTORY = os.path.join(PUBLIC_ROOT, "images", "news")
 IMAGE_WEB_PATH = "/images/news/"
+OUTPUT_JSON = "news_data.json"
 
 MAX_WORKERS = 10
-BATCH_SIZE = 20
 MAX_CONSECUTIVE_EMPTY_PAGES = 3
 IMAGE_DOWNLOAD_WORKERS = 5
 
@@ -47,18 +43,6 @@ def get_session():
         )
         thread_local.session = session
     return thread_local.session
-
-
-def create_pg_connection():
-    """Create PostgreSQL connection using psycopg2"""
-    url = urlparse(POSTGRES_URL)
-    return psycopg2.connect(
-        host=url.hostname,
-        port=url.port,
-        database=url.path[1:],
-        user=url.username,
-        password=url.password,
-    )
 
 
 def setup_directories():
@@ -91,27 +75,6 @@ def download_image(image_url):
     except Exception as e:
         print(f"    - Error downloading image {image_url}: {e}")
         return None
-
-
-def determine_category(article_url, tags):
-    url_lower = article_url.lower()
-    tags_lower = " ".join(tags).lower() if tags else ""
-
-    if (
-        "prestasi" in url_lower
-        or "prestasi" in tags_lower
-        or "achievement" in tags_lower
-    ):
-        return "achievements"
-    elif (
-        "event" in url_lower
-        or "event" in tags_lower
-        or "acara" in tags_lower
-        or "kegiatan" in tags_lower
-    ):
-        return "events"
-    else:
-        return "general"
 
 
 def scrape_article_details(article_url, base_url):
@@ -163,14 +126,11 @@ def scrape_article_details(article_url, base_url):
                     f"    - Error parsing datetime '{datetime_str}': {e}"
                 )
 
-        category = determine_category(article_url, tags)
-
         return {
             "title": title,
             "content_html": content_html,
             "tags": tags,
             "image_urls": image_urls,
-            "category": category,
             "published_date": published_date,
         }
     except Exception as e:
@@ -178,8 +138,8 @@ def scrape_article_details(article_url, base_url):
         return None
 
 
-def process_article(article_data):
-    """Process a single article - now independent of database connection"""
+def process_article(article_data, article_counter):
+    """Process a single article"""
     (
         post_id,
         article_url,
@@ -207,7 +167,7 @@ def process_article(article_data):
     thumbnail_web_path = (
         f"{IMAGE_WEB_PATH}{os.path.basename(thumbnail_local_path)}"
         if thumbnail_local_path
-        else None
+        else "/images/placeholder.jpg"
     )
 
     # Download content images in parallel and replace URLs
@@ -242,25 +202,16 @@ def process_article(article_data):
     )
 
     return {
-        "post_id": post_id,
+        "id": str(article_counter),
         "slug": slug,
         "title": details["title"],
         "subtitle": "",
         "thumbnail": thumbnail_web_path,
-        "tags": json.dumps(details["tags"]),
+        "tags": details["tags"],
         "content": processed_content,
-        "published_at": parsed_date,
+        "publishedAt": parsed_date,
         "author": "SMKN 2 Singosari",
-        "category": details["category"],
-        "url": article_url,
     }
-
-
-def get_existing_post_ids(conn):
-    """Get all existing post IDs from PostgreSQL to avoid duplicates."""
-    with conn.cursor() as c:
-        c.execute("SELECT slug FROM news")
-        return set(row[0] for row in c.fetchall())
 
 
 def generate_slug(title):
@@ -268,32 +219,6 @@ def generate_slug(title):
     slug = re.sub(r"[^\w\s-]", "", title).strip().lower()
     slug = re.sub(r"[\s-]+", "-", slug)
     return slug
-
-
-def insert_batch(conn, batch):
-    """Insert a batch of articles into the PostgreSQL database."""
-    with conn.cursor() as c:
-        for article in batch:
-            c.execute(
-                """
-                INSERT INTO news (slug, title, subtitle, thumbnail,
-                                  tags, content, published_at, author)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (slug) DO NOTHING
-                """,
-                (
-                    article["slug"],
-                    article["title"],
-                    article["subtitle"],
-                    article["thumbnail"],
-                    article["tags"],
-                    article["content"],
-                    article["published_at"],
-                    article["author"],
-                ),
-            )
-    conn.commit()
-    print(f"  -> Committed batch of {len(batch)} articles.")
 
 
 def scrape_page(page, news_category_url, base_url, month_map):
@@ -397,7 +322,6 @@ def scrape_page(page, news_category_url, base_url, month_map):
 def main():
     """Main function to run the scraper."""
     setup_directories()
-    pg_conn = create_pg_connection()
 
     base_url = "https://smkn2-singosari.sch.id/"
     news_category_url = f"{base_url}?cat=4"
@@ -417,8 +341,17 @@ def main():
         "Des": "12",
     }
 
-    existing_slugs = get_existing_post_ids(pg_conn)
-    print(f"Found {len(existing_slugs)} existing articles in PostgreSQL.")
+    # Load existing data if file exists
+    existing_slugs = set()
+    article_counter = 1
+    if os.path.exists(OUTPUT_JSON):
+        with open(OUTPUT_JSON, "r", encoding="utf-8") as f:
+            existing_data = json.load(f)
+            existing_slugs = {item["slug"] for item in existing_data}
+            article_counter = len(existing_data) + 1
+        print(f"Found {len(existing_slugs)} existing articles in JSON file.")
+    else:
+        existing_data = []
 
     # Phase 1: Scrape all pages in parallel to get article URLs
     print("\n=== Phase 1: Scanning pages for article URLs ===")
@@ -449,7 +382,6 @@ def main():
                             f"Stopping: {MAX_CONSECUTIVE_EMPTY_PAGES} "
                             f"consecutive pages with errors/no content."
                         )
-                        # Cancel remaining futures
                         for f in page_futures:
                             f.cancel()
                         break
@@ -509,43 +441,46 @@ def main():
     # Phase 2: Process articles in parallel
     print("\n=== Phase 2: Processing articles in parallel ===")
     processed_count = 0
-    new_articles_batch = []
-    batch_lock = threading.Lock()
+    new_articles = []
+    data_lock = threading.Lock()
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_task = {
-            executor.submit(process_article, task): task
-            for task in all_tasks
+            executor.submit(
+                process_article, task, article_counter + i
+            ): task
+            for i, task in enumerate(all_tasks)
         }
 
         for future in as_completed(future_to_task):
             try:
                 result = future.result()
                 if result:
-                    with batch_lock:
+                    with data_lock:
                         if result["slug"] not in existing_slugs:
-                            new_articles_batch.append(result)
+                            new_articles.append(result)
                             existing_slugs.add(result["slug"])
                             processed_count += 1
                             print(
-                                f"  - Queued ({processed_count}): "
+                                f"  - Processed ({processed_count}): "
                                 f"{result['title'][:50]}..."
                             )
-
-                            if len(new_articles_batch) >= BATCH_SIZE:
-                                insert_batch(pg_conn, new_articles_batch)
-                                new_articles_batch = []
             except Exception as e:
                 print(f"Error processing article: {e}")
 
-    # Insert remaining articles
-    if new_articles_batch:
-        insert_batch(pg_conn, new_articles_batch)
+    # Combine existing and new articles
+    all_articles = existing_data + new_articles
 
-    pg_conn.close()
+    # Sort by publishedAt descending
+    all_articles.sort(key=lambda x: x["publishedAt"], reverse=True)
+
+    # Save to JSON file
+    with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
+        json.dump(all_articles, f, ensure_ascii=False, indent=2)
+
     print(
-        f"\n=== Scraping finished. Added {processed_count} new articles "
-        f"to the database. ==="
+        f"\n=== Scraping finished. Added {processed_count} new articles. "
+        f"Total: {len(all_articles)} articles in {OUTPUT_JSON} ==="
     )
 
 
